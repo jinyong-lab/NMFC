@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pth
+*.npy
+data/
+.omc/
+.claude/
+.idea/
+.vscode/
+*.log
