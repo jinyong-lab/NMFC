@@ -4,6 +4,54 @@
 
 ---
 
+## [v3] - 2026-04-20
+
+### 참고논문 기반 개선 (방법론적 엄밀성 + 일반화 성능)
+
+#### Added
+- `nmfc.py::ood_score()` — Free Energy 기반 OOD 탐지 함수
+  - `E(x) = -LogSumExp_k logits[k]`
+  - 근거: Ref 10 JEM §3 (모든 softmax 분류기는 암묵적으로 EBM)
+- `train.py::set_seed()` — 재현성 확보
+  - torch/numpy/cuda/cudnn seed 모두 42로 고정
+- `train.py::ProjectionHead` — **learnable temperature** (nn.Parameter)
+  - `log_temperature` 파라미터로 log-space에서 학습
+  - 근거: Ref 11 SphereFace §3.2, Ref 12 Prototypical §3
+- `train.py::phase2_loss()` — **multi-task loss** (NMFC + 0.1×MFA)
+  - Phase 2에서 Phase 1 구조 보존
+  - 근거: Ref 2 MFA §3 (S_w min + S_b max 동시 유지)
+- `train.py::make_train_val_loaders()` — train 80/20 split
+  - val로 best checkpoint 선정, test는 마지막 1회만 평가
+  - 근거: 학계 표준 (v2의 test leak 문제 해결)
+
+#### Changed
+- `train.py::train()` — 평가 프로토콜 변경
+  - 매 epoch val 평가 (이전: 5 epoch마다)
+  - 학습 종료 후 best checkpoint 로드 → test 평가 1회
+- `train.py::train()` — `num_classes` 자동 추론
+  - `len(DATASET_CLASSES[dataset_name])` (하드코딩 제거)
+
+### 결과 (Honest test accuracy, no data leak)
+| Dataset | v2 (w/ leak) | v3 (honest) |
+|---------|:---:|:---:|
+| CIFAR-10 | 89.09% | **87.82%** |
+| Fashion-MNIST | 89.65% | **90.17%** |
+| STL-10 | 94.34% | **94.96%** |
+
+- v2의 CIFAR 89.09%는 test set으로 best 선정 → 과대평가
+- v3는 train/val/test 엄격 분리 → 실제 일반화 성능
+- Fashion/STL은 개선, CIFAR는 data leak 제거로 정직한 수치
+
+### 해결된 Issues
+- ✅ #4 Temperature 고정 → learnable
+- ✅ #5 Phase 2 FR 급락 → multi-task loss
+- ✅ #7 Test set data leak → train/val split
+- ✅ #9 OOD 미구현 → ood_score() 함수
+- ✅ #10 num_classes 하드코딩 → 자동 추론
+- ✅ #11 Random seed 미고정 → set_seed(42)
+
+---
+
 ## [v2] - 2026-04-19
 
 ### 핵심 개선 (74.53% → 89.09%, +14.56%p on CIFAR-10)

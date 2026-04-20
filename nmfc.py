@@ -139,8 +139,21 @@ def compute_logits(E_pos, E_neg, lam, temperature=20.0):
     Temperature scaling amplifies the narrow logit range (~0.27) so that
     softmax produces peaked probabilities instead of near-uniform ~10%.
     Ref 11 SphereFace, Ref 12 Prototypical both use temperature/scale.
+
+    temperature can be a scalar or a tensor (for learnable temperature).
     """
     return temperature * (E_pos - lam * E_neg)
+
+
+def ood_score(logits):
+    """
+    OOD detection via Free Energy (Ref 10 JEM §3):
+        E(x) = -LogSumExp_k logits[k]
+
+    High E(x) -> low p(x) -> OOD candidate.
+    Returns per-sample OOD score (higher = more OOD-like).
+    """
+    return -torch.logsumexp(logits, dim=1)
 
 
 # ─────────────────────────────────────────────────────────────

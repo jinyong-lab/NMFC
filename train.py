@@ -1,24 +1,40 @@
-# Last updated: 2026-04-15 18:30
+# Last updated: 2026-04-20 (v3)
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
+from torch.utils.data import DataLoader, random_split
 
-from dataset import get_loaders
+from dataset import get_loaders, DATASET_CLASSES
 from backbone import get_backbone
-from nmfc import nmfc_loss, linear_mfa_loss, fisher_ratio, auto_sigma, APTController
+from nmfc import (
+    nmfc_loss, linear_mfa_loss, fisher_ratio,
+    auto_sigma, compute_energies, compute_logits, APTController,
+)
 
 
 # ─────────────────────────────────────────────────────────────
-# Projection head: 512D → embedding_dim → L2-normalized hypersphere
+# v3 (2026-04-20): Random seed fixing (Issue #11)
+# ─────────────────────────────────────────────────────────────
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ─────────────────────────────────────────────────────────────
+# Projection head with learnable temperature (Ref 11 SphereFace §3.2,
+# Ref 12 Prototypical §3) — Issue #4
 # ─────────────────────────────────────────────────────────────
 
 class ProjectionHead(nn.Module):
-    # v2 (2026-04-19): Deeper head with BatchNorm.
-    # Frozen backbone means this is the ONLY learnable component.
-    # Ref 5 Contrastive/SimCLR: deeper heads + BN improve representations.
-    def __init__(self, in_dim=512, out_dim=128):
+    def __init__(self, in_dim=512, out_dim=128, init_temp=20.0):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 512),
@@ -29,28 +45,19 @@ class ProjectionHead(nn.Module):
             nn.ReLU(),
             nn.Linear(256, out_dim)
         )
+        # v3: learnable temperature parameter
+        self.log_temperature = nn.Parameter(torch.tensor(np.log(init_temp)))
+
+    @property
+    def temperature(self):
+        return self.log_temperature.exp()
 
     def forward(self, x):
         return self.net(x)
 
 
 # ─────────────────────────────────────────────────────────────
-# Extract all embeddings from backbone (no grad needed)
-# ─────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def extract_embeddings(backbone, loader, device):
-    all_emb, all_lbl = [], []
-    for images, labels in loader:
-        images = images.to(device)
-        emb = backbone(images)
-        all_emb.append(emb.cpu())
-        all_lbl.append(labels)
-    return torch.cat(all_emb), torch.cat(all_lbl)
-
-
-# ─────────────────────────────────────────────────────────────
-# Evaluate top-1 accuracy
+# Evaluation
 # ─────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -59,10 +66,10 @@ def evaluate(head, backbone, loader, device, sigma, lam, num_classes):
     correct, total = 0, 0
     for images, labels in loader:
         images, labels = images.to(device), labels.to(device)
-        with torch.no_grad():
-            feats = backbone(images)
+        feats = backbone(images)
         embeddings = head(feats)
-        _, logits = nmfc_loss(embeddings, labels, sigma, lam, num_classes)
+        E_pos, E_neg = compute_energies(embeddings, labels, sigma, num_classes)
+        logits = compute_logits(E_pos, E_neg, lam, temperature=head.temperature)
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
@@ -71,221 +78,201 @@ def evaluate(head, backbone, loader, device, sigma, lam, num_classes):
 
 
 # ─────────────────────────────────────────────────────────────
-# Training loop (single dataset)
+# v3 loss: Phase 2 = NMFC + α * MFA (Ref 2 MFA §3) — Issue #5
+# ─────────────────────────────────────────────────────────────
+
+def phase2_loss(embeddings, labels, sigma, lam, num_classes, temperature,
+                mfa_weight=0.1):
+    """
+    NMFC cross-entropy + alpha * MFA scatter ratio.
+
+    Rationale (Issue #5): Phase 1 Linear MFA builds good S_w/S_b structure
+    but switching to pure NMFC destroys it (FR drops >90%). Keeping a small
+    MFA term preserves that structure — the multi-task principle from
+    Ref 2 MFA §3 (simultaneous S_w min + S_b max).
+    """
+    E_pos, E_neg = compute_energies(embeddings, labels, sigma, num_classes)
+    logits = compute_logits(E_pos, E_neg, lam, temperature=temperature)
+    loss_nmfc = F.cross_entropy(logits, labels)
+    loss_mfa = linear_mfa_loss(embeddings, labels, num_classes)
+    return loss_nmfc + mfa_weight * loss_mfa, logits
+
+
+# ─────────────────────────────────────────────────────────────
+# v3 train/val split (Issue #7) — NO test leak
+# ─────────────────────────────────────────────────────────────
+
+def make_train_val_loaders(dataset_name, batch_size, num_workers, val_frac=0.2, seed=42):
+    """
+    v3: split train set into 80% train / 20% val.
+    Test set remains held out — evaluated only once at the end.
+    """
+    train_full, test_loader = get_loaders(
+        dataset_name, batch_size=batch_size, num_workers=num_workers
+    )
+    train_ds = train_full.dataset
+    n_total = len(train_ds)
+    n_val = int(n_total * val_frac)
+    n_train = n_total - n_val
+    g = torch.Generator().manual_seed(seed)
+    train_sub, val_sub = random_split(train_ds, [n_train, n_val], generator=g)
+    train_loader = DataLoader(train_sub, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_sub, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=True)
+    return train_loader, val_loader, test_loader
+
+
+# ─────────────────────────────────────────────────────────────
+# Training loop (v3)
 # ─────────────────────────────────────────────────────────────
 
 def train(config, dataset_name):
-    """
-    Train NMFC on a single dataset.
+    set_seed(config["seed"])
 
-    EN: Output files are named with the dataset so results from different
-        datasets never overwrite each other:
-          head_<dataset>.pth       — final weights
-          best_head_<dataset>.pth  — best Phase 2 weights
-          fisher_log_<dataset>.npy — per-epoch Fisher Ratio
-    KR: 출력 파일에 데이터셋 이름을 붙여 서로 덮어쓰지 않도록 함:
-          head_<dataset>.pth       — 최종 가중치
-          best_head_<dataset>.pth  — Phase 2 최적 가중치
-          fisher_log_<dataset>.npy — 에포크별 Fisher Ratio
-    """
     device = (
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
         else "cpu"
     )
     print(f"\n{'='*60}")
-    print(f"Dataset: {dataset_name.upper()}  |  Device: {device}")
+    print(f"Dataset: {dataset_name.upper()}  |  Device: {device}  |  v3")
     print(f"{'='*60}")
 
-    # Data
-    train_loader, test_loader = get_loaders(
-        dataset_name,
-        batch_size=config["batch_size"],
-        num_workers=config["num_workers"]
+    # v3: train/val/test split
+    train_loader, val_loader, test_loader = make_train_val_loaders(
+        dataset_name, batch_size=config["batch_size"],
+        num_workers=config["num_workers"], seed=config["seed"]
     )
 
-    # Backbone (frozen ResNet-18)
     backbone = get_backbone(device, pretrained=True, freeze=True)
 
-    # Projection head (trainable)
-    head = ProjectionHead(in_dim=512, out_dim=config["embedding_dim"]).to(device)
+    # v3: num_classes from dataset (Issue #10)
+    num_classes = len(DATASET_CLASSES[dataset_name])
 
-    # Optimizer
+    head = ProjectionHead(
+        in_dim=512, out_dim=config["embedding_dim"],
+        init_temp=config["temperature"]
+    ).to(device)
+
     optimizer = optim.Adam(head.parameters(), lr=config["lr"], weight_decay=1e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
 
-    # EN: max_phase1_epochs is a general APT parameter, not dataset-specific.
-    #     -1 = rely only on FR stabilization (pure APT, original paper behavior)
-    #      N = force Phase 2 transition at epoch N regardless of dataset.
-    #     Useful when FR never stabilizes (e.g. Fashion-MNIST, STL-10 with
-    #     frozen ResNet-18), but applies equally to any dataset.
-    #     Clamped to config["epochs"] so it can never exceed total training.
-    #     Last updated: 2026-04-15
-    # KR: max_phase1_epochs는 데이터셋별이 아닌 일반 APT 파라미터.
-    #     -1 = FR 안정화에만 의존 (순수 APT, 원본 논문 동작)
-    #      N = 데이터셋에 관계없이 epoch N에서 Phase 2 강제 전환.
-    #     FR이 안정화되지 않는 경우(예: Fashion-MNIST, STL-10)에 유용하나
-    #     모든 데이터셋에 동일하게 적용됨.
-    #     총 훈련 epochs를 초과하지 않도록 클램핑.
-    #     최종 수정: 2026-04-15
     raw = config["max_phase1_epochs"]
-    if raw == -1:
-        max_p1 = None
-    else:
-        max_p1 = min(int(raw), config["epochs"])
-        if max_p1 != raw:
-            print(f"[APT] max_phase1_epochs clamped to {max_p1} (cannot exceed epochs={config['epochs']})")
+    max_p1 = None if raw == -1 else min(int(raw), config["epochs"])
 
     apt = APTController(
-        delta=config["apt_delta"],
-        patience=config["apt_patience"],
+        delta=config["apt_delta"], patience=config["apt_patience"],
         max_phase1_epochs=max_p1
     )
 
-    num_classes = 10
     sigma = config["sigma"]
-    lam   = config["lam"]
+    lam = config["lam"]
+    mfa_weight = config["mfa_weight"]
     fisher_log = []
     phase2_triggered = False
-    best_acc = 0.0          # EN: track best Phase 2 accuracy for checkpointing
-                            # KR: 체크포인트를 위한 Phase 2 최고 정확도 추적
+    best_val_acc = 0.0
+    best_epoch = 0
 
     for epoch in range(1, config["epochs"] + 1):
         head.train()
-        total_loss = 0.0
-        fr_accum   = 0.0
-        steps      = 0
+        total_loss, fr_accum, steps = 0.0, 0.0, 0
 
         for images, labels in train_loader:
             images, labels = images.to(device), labels.to(device)
-
             with torch.no_grad():
                 feats = backbone(images)
-
             embeddings = head(feats)
 
-            # Auto sigma: median of pairwise distances in mini-batch
             if config["sigma"] == -1:
                 sigma = auto_sigma(embeddings.detach())
 
-            # ── Phase selection ──────────────────────────────
             if apt.phase == 1:
                 loss = linear_mfa_loss(embeddings, labels, num_classes)
             else:
-                loss, _ = nmfc_loss(embeddings, labels, sigma, lam, num_classes)
+                # v3: NMFC + alpha*MFA (Issue #5)
+                loss, _ = phase2_loss(
+                    embeddings, labels, sigma, lam, num_classes,
+                    temperature=head.temperature, mfa_weight=mfa_weight
+                )
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-
-            # Accumulate Fisher Ratio for APT (cheap, no extra backward)
             with torch.no_grad():
                 fr_accum += fisher_ratio(embeddings.detach(), labels, num_classes)
-
             steps += 1
 
-        # EN: Only step the cosine scheduler during Phase 1.
-        #     In Phase 2 the lr is fixed to lr_phase2; continuing to call
-        #     scheduler.step() lets the cosine formula (anchored at lr=1e-3)
-        #     override the manually-set lr_phase2 and causes loss divergence.
-        #     Observed: loss rising from 1.797 to 1.806 after epoch ~30 with
-        #     emb=128. Peak accuracy was epoch 30 (75.97%), then degraded.
-        #     Fix: freeze the scheduler once Phase 2 is active.
-        #     Last updated: 2026-04-14
-        # KR: 코사인 스케줄러는 Phase 1에서만 step.
-        #     Phase 2에서는 lr을 lr_phase2로 고정해야 하는데,
-        #     계속 step하면 코사인 공식(lr=1e-3 기준)이 수동 설정값을
-        #     덮어써 손실 발산을 유발함.
-        #     관찰: emb=128에서 epoch ~30 이후 손실 1.797 → 1.806 상승,
-        #     정확도 75.97%(epoch 30) 이후 하락.
-        #     수정: Phase 2 진입 후 스케줄러 동결.
-        #     최종 수정: 2026-04-14
         if apt.phase == 1:
             scheduler.step()
 
         avg_loss = total_loss / steps
-        avg_fr   = fr_accum / steps
+        avg_fr = fr_accum / steps
         fisher_log.append(avg_fr)
-        phase    = apt.update(avg_fr)
+        phase = apt.update(avg_fr)
 
-        # Reduce lr when Phase 2 is triggered for the first time
         if apt.phase == 2 and not phase2_triggered:
             phase2_triggered = True
             for g in optimizer.param_groups:
                 g["lr"] = config["lr_phase2"]
             print(f"[APT] Learning rate reduced to {config['lr_phase2']}")
 
-        print(f"Epoch {epoch:3d} | Phase {phase} | Loss {avg_loss:.4f} | Fisher Ratio {avg_fr:.4f}")
+        tau = head.temperature.item()
+        print(f"Epoch {epoch:3d} | Phase {phase} | Loss {avg_loss:.4f} | "
+              f"FR {avg_fr:.4f} | tau {tau:.2f}")
 
-        # Evaluate every 5 epochs and save best checkpoint
-        # EN: Phase 2 accuracy peaks early (epoch ~25-30) then degrades as the
-        #     NMFC geometric loss reshapes embeddings away from Phase 1 structure.
-        #     Save best_head_<dataset>.pth whenever a new accuracy peak is found.
-        #     Last updated: 2026-04-14
-        # KR: Phase 2 정확도는 초기(epoch ~25-30)에 정점을 찍고 하락함.
-        #     NMFC 기하학적 손실이 Phase 1 구조를 점진적으로 해체하기 때문.
-        #     새로운 정확도 최고점 발견 시 best_head_<dataset>.pth 저장.
-        #     최종 수정: 2026-04-14
-        if epoch % 5 == 0 and apt.phase == 2:
-            acc = evaluate(head, backbone, test_loader, device, sigma, lam, num_classes)
-            print(f"           >> Test Accuracy: {acc*100:.2f}%")
-            if acc > best_acc:
-                best_acc = acc
+        # v3: evaluate every epoch on VALIDATION (not test!) during Phase 2
+        if apt.phase == 2:
+            val_acc = evaluate(head, backbone, val_loader, device, sigma, lam, num_classes)
+            print(f"           >> Val Accuracy: {val_acc*100:.2f}%")
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_epoch = epoch
                 torch.save(head.state_dict(), f"best_head_{dataset_name}.pth")
-                print(f"           >> New best! Saved to best_head_{dataset_name}.pth ({acc*100:.2f}%)")
+                print(f"           >> New best val! Saved ({val_acc*100:.2f}%)")
 
-    # Save final weights and Fisher Ratio log
+    # v3: test evaluation ONCE at the end, using best val checkpoint
+    print(f"\nLoading best checkpoint from epoch {best_epoch} "
+          f"(val acc {best_val_acc*100:.2f}%)...")
+    head.load_state_dict(torch.load(f"best_head_{dataset_name}.pth"))
+    test_acc = evaluate(head, backbone, test_loader, device, sigma, lam, num_classes)
+    print(f"*** FINAL TEST Accuracy: {test_acc*100:.2f}% ***")
+
     torch.save(head.state_dict(), f"head_{dataset_name}.pth")
     np.save(f"fisher_log_{dataset_name}.npy", np.array(fisher_log))
-    print(f"Training complete. Final model  → head_{dataset_name}.pth")
-    print(f"                   Best model   → best_head_{dataset_name}.pth ({best_acc*100:.2f}%)")
-    print(f"                   Fisher log   → fisher_log_{dataset_name}.npy")
+    print(f"Training complete.  Best val: {best_val_acc*100:.2f}% @ epoch {best_epoch}  |  "
+          f"Test: {test_acc*100:.2f}%  |  final tau: {head.temperature.item():.2f}")
+    return test_acc
 
 
 # ─────────────────────────────────────────────────────────────
-# Entry point — dataset selection
+# Entry point
 # ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     config = {
-        "epochs"       : 50,      # EN: 50 epochs for Phase 2 to train sufficiently (2026-04-19)
-                                  # KR: 빠른 반복을 위해 35로 감소 (2026-04-15)
-        "batch_size"   : 128,
-        "num_workers"  : 4,
-        "embedding_dim": 128,     # EN: 128 outperforms 64 (+1.4% accuracy, 2026-04-14)
-                                  # KR: 128이 64보다 +1.4% 정확도 향상 (2026-04-14)
-        "lr"           : 1e-3,
-        "lr_phase2"    : 2e-4,    # EN: fixed lr for Phase 2 (scheduler frozen)
-                                  # KR: Phase 2 고정 lr (스케줄러 동결)
-        "sigma"        : -1,      # -1 = auto (median heuristic, scale=0.5)
-        "lam"          : 0.5,
-        "apt_delta"    : 0.05,
-        "apt_patience" : 5,
-        # EN: Max epochs to stay in Phase 1 before forcing transition to Phase 2.
-        #     -1 = automatic (APT triggers only when Fisher Ratio stabilizes).
-        #      N = force Phase 2 at epoch N, works for any dataset.
-        #     Cannot exceed "epochs" — clamped automatically if so.
-        #     Recommended: -1 for CIFAR-10 (FR stabilizes naturally),
-        #                  15 for Fashion-MNIST or STL-10 (FR may not stabilize).
-        #     Last updated: 2026-04-15
-        # KR: Phase 2로 강제 전환하기 전 Phase 1의 최대 에포크 수.
-        #     -1 = 자동 (Fisher Ratio가 안정화될 때만 APT 트리거).
-        #      N = 데이터셋에 관계없이 epoch N에서 Phase 2 강제 전환.
-        #     "epochs"를 초과할 수 없음 — 초과 시 자동 클램핑.
-        #     권장: CIFAR-10은 -1 (FR이 자연적으로 안정화),
-        #           Fashion-MNIST 또는 STL-10은 15 (FR이 안정화 안될 수 있음).
-        #     최종 수정: 2026-04-15
+        "seed"             : 42,         # v3: reproducibility (Issue #11)
+        "epochs"           : 50,
+        "batch_size"       : 128,
+        "num_workers"      : 4,
+        "embedding_dim"    : 128,
+        "lr"               : 1e-3,
+        "lr_phase2"        : 2e-4,
+        "sigma"            : -1,
+        "lam"              : 0.5,
+        "temperature"      : 20.0,       # v3: initial temperature, learnable
+        "mfa_weight"       : 0.1,        # v3: alpha for Phase 2 multi-task
+        "apt_delta"        : 0.05,
+        "apt_patience"     : 5,
         "max_phase1_epochs": 15,
     }
 
-    # EN: Interactive dataset selection menu at runtime.
-    # KR: 실행 시 대화형 데이터셋 선택 메뉴.
     print("\nSelect dataset to train on:")
-    print("  1. CIFAR-10        (60,000 images, 32x32 RGB,  10 classes)")
-    print("  2. Fashion-MNIST   (70,000 images, 28x28 gray, 10 classes)")
-    print("  3. STL-10          ( 5,000 train,  96x96 RGB,  10 classes)")
+    print("  1. CIFAR-10")
+    print("  2. Fashion-MNIST")
+    print("  3. STL-10")
     print("  4. All three sequentially")
 
     MENU = {
@@ -299,7 +286,14 @@ if __name__ == "__main__":
         choice = input("\nEnter option (1 / 2 / 3 / 4): ").strip()
         if choice in MENU:
             break
-        print("  Invalid option. Please enter 1, 2, 3, or 4.")
+        print("  Invalid option.")
 
+    results = {}
     for ds in MENU[choice]:
-        train(config, ds)
+        results[ds] = train(config, ds)
+
+    print("\n" + "="*60)
+    print("v3 SUMMARY (test accuracy on held-out test set)")
+    print("="*60)
+    for ds, acc in results.items():
+        print(f"  {ds:15s}: {acc*100:.2f}%")
