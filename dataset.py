@@ -114,6 +114,73 @@ def get_loaders(dataset_name, data_dir='./data', batch_size=128, num_workers=2):
     return train_loader, test_loader
 
 
+# v4 (2026-04-20): Return BOTH augmented and clean train datasets.
+# Rationale (Ref 5 SimCLR §3): val/test must use clean transforms.
+# Returning both lets make_train_val_loaders split by index and assign
+# augmented transform to train subset, clean transform to val subset.
+def get_train_datasets_both_transforms(dataset_name, data_dir='./data'):
+    """Return (train_ds_augmented, train_ds_clean, test_loader)."""
+    dataset_name = dataset_name.lower().strip()
+
+    if dataset_name == "cifar10":
+        aug = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                 std=[0.2470, 0.2435, 0.2616])
+        ])
+        clean = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.4914, 0.4822, 0.4465],
+                                 std=[0.2470, 0.2435, 0.2616])
+        ])
+        train_aug = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=aug)
+        train_clean = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=clean)
+        test_ds = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=clean)
+
+    elif dataset_name == "fashionmnist":
+        aug = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.Grayscale(num_output_channels=3),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+        ])
+        clean = transforms.Compose([
+            transforms.Resize(224),
+            transforms.Grayscale(num_output_channels=3),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5]*3, std=[0.5]*3)
+        ])
+        train_aug = datasets.FashionMNIST(root=data_dir, train=True, download=True, transform=aug)
+        train_clean = datasets.FashionMNIST(root=data_dir, train=True, download=True, transform=clean)
+        test_ds = datasets.FashionMNIST(root=data_dir, train=False, download=True, transform=clean)
+
+    elif dataset_name == "stl10":
+        aug = transforms.Compose([
+            transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.4467, 0.4398, 0.4066],
+                                 std=[0.2603, 0.2566, 0.2713])
+        ])
+        clean = transforms.Compose([
+            transforms.Resize(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.4467, 0.4398, 0.4066],
+                                 std=[0.2603, 0.2566, 0.2713])
+        ])
+        train_aug = datasets.STL10(root=data_dir, split='train', download=True, transform=aug)
+        train_clean = datasets.STL10(root=data_dir, split='train', download=True, transform=clean)
+        test_ds = datasets.STL10(root=data_dir, split='test', download=True, transform=clean)
+    else:
+        raise ValueError(f"Unknown dataset '{dataset_name}'")
+
+    return train_aug, train_clean, test_ds
+
+
 # EN: Legacy wrapper kept for backward compatibility with diagnostics.py
 # KR: diagnostics.py 하위 호환성을 위해 기존 래퍼 유지
 def get_cifar10_loaders(data_dir='./data', batch_size=128, num_workers=2):

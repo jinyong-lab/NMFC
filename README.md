@@ -8,13 +8,14 @@
 
 ## 📊 결과 (CIFAR-10 / Fashion-MNIST / STL-10)
 
-| 데이터셋 | v0 (원본) | v2 | **v3 (최신)** | 비고 |
+| 데이터셋 | v0 | v2 (leak) | v3 | **v4 (최신)** |
 |---------|:---:|:---:|:---:|:---:|
-| CIFAR-10 | 74.53% | 89.09%* | **87.82%** | *v2는 test leak |
-| Fashion-MNIST | — | 89.65%* | **90.17%** | train/val/test 엄격 분리 |
-| STL-10 | — | 94.34%* | **94.96%** | Honest test accuracy |
+| CIFAR-10 | 74.53% | 89.09%* | 87.82% | **87.88%** |
+| Fashion-MNIST | — | 89.65%* | 90.17% | **89.66%** |
+| STL-10 | — | 94.34%* | 94.96% | **94.51%** |
 
-v3는 train/val/test를 엄격하게 분리한 정직한 test 수치입니다.
+*v2는 test leak된 과대평가. v3부터 train/val/test 엄격 분리.
+v4는 val augmentation 버그 제거 + MFA weight schedule + fixed τ 적용.
 
 ---
 

@@ -4,6 +4,40 @@
 
 ---
 
+## [v4] - 2026-04-21
+
+### 참고논문 재검토 기반 교정 (v3의 오해결 수정)
+
+#### Changed
+- `train.py::ProjectionHead` — **learnable temperature 제거** (nn.Parameter 삭제)
+  - 참고논문 재검토 결과: SphereFace §4.1, ArcFace §3.3, CosFace §3.2 모두
+    scale/margin을 **하이퍼파라미터로 고정**. Learnable 버전 없음.
+  - `τ=20.0` 고정값 유지 (하이퍼파라미터 sweep으로 튜닝 권장)
+- `dataset.py::get_train_datasets_both_transforms()` — **val은 clean transform**
+  - Ref 5 SimCLR §3: val/test는 augmentation 없이 Resize만
+  - v3의 `random_split`은 train augmentation을 val에도 적용하는 버그
+- `train.py::make_loaders()` — Subset 기반 split (train augmented, val clean)
+- `train.py::mfa_weight_schedule()` — **linear decay schedule** 1.0 → 0.1
+  - Ref 2 MFA §3 ratio form은 S_w/S_b를 동등 가중 → 초기 alpha를 높게
+  - Phase 2 초반은 Phase 1 구조 보존(α=1.0), 후반은 NMFC 주도(α=0.1)
+
+### 결과 (v4 honest test)
+| Dataset | v3 | v4 |
+|---------|:---:|:---:|
+| CIFAR-10 | 87.82% | **87.88%** |
+| Fashion-MNIST | 90.17% | **89.66%** |
+| STL-10 | 94.96% | **94.51%** |
+
+- CIFAR 미세 개선, Fashion/STL 약간 하락 (MFA 초기 alpha가 너무 높은 듯)
+- **방법론적으로는 가장 엄밀** (val bug 제거, 논문 관행 준수)
+- FR 급락 크게 완화: CIFAR -64% (v3는 -79%)
+
+### Issue 교정
+- v3에서 learnable τ로 "#4 해결"했다고 했으나, 실제 참고논문은 learnable을
+  지지하지 않음 → v4에서 fixed τ로 정정
+
+---
+
 ## [v3] - 2026-04-20
 
 ### 참고논문 기반 개선 (방법론적 엄밀성 + 일반화 성능)
