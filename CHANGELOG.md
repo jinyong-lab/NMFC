@@ -4,6 +4,29 @@
 
 ---
 
+## [v5] - 2026-04-21
+
+### 데이터셋별 MFA weight 튜닝
+
+#### Changed
+- `train.py::__main__` — **per-dataset MFA weight config** 도입
+  - CIFAR-10: `1.0 → 0.1` (어려운 데이터셋, FR 46)
+  - Fashion-MNIST: `0.5 → 0.05` (쉬운 데이터셋, FR 3,700)
+  - STL-10: `0.5 → 0.05` (중간, FR 236)
+- `BASE` config + `PER_DATASET` overrides 패턴
+
+### 결과
+| Dataset | v4 | **v5** |
+|---------|:---:|:---:|
+| CIFAR-10 | 87.88% | **87.88%** (동일) |
+| Fashion-MNIST | 89.66% | **90.02%** (+0.36%p) |
+| STL-10 | 94.51% | **94.49%** (±0) |
+
+- Fashion-MNIST 회복: MFA 초기 값 완화로 NMFC 학습 충분
+- CIFAR-10은 v4와 동일 config → 결과 동일 (재현성 확인)
+
+---
+
 ## [v4] - 2026-04-21
 
 ### 참고논문 재검토 기반 교정 (v3의 오해결 수정)

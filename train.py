@@ -238,7 +238,12 @@ def train(config, dataset_name):
 
 
 if __name__ == "__main__":
-    config = {
+    # v5 (2026-04-21): Per-dataset MFA weight tuning.
+    # Rationale: v4's alpha_start=1.0 was too restrictive for easier datasets
+    # (Fashion/STL) where Phase 1 FR grows very large (3700/1800) — MFA
+    # dominance in early Phase 2 suppressed NMFC learning.
+    # CIFAR is harder (FR 46), so alpha=1.0 is appropriate.
+    BASE = {
         "seed"              : 42,
         "epochs"            : 50,
         "batch_size"        : 128,
@@ -248,18 +253,23 @@ if __name__ == "__main__":
         "lr_phase2"         : 2e-4,
         "sigma"             : -1,
         "lam"               : 0.5,
-        "temperature"       : 20.0,     # v4: FIXED (SphereFace/ArcFace convention)
-        "mfa_weight_start"  : 1.0,      # v4: MFA schedule (MFA §3 ratio form)
-        "mfa_weight_end"    : 0.1,
+        "temperature"       : 20.0,
         "apt_delta"         : 0.05,
         "apt_patience"      : 5,
         "max_phase1_epochs" : 15,
     }
 
+    # Per-dataset overrides (v5)
+    PER_DATASET = {
+        "cifar10"     : {"mfa_weight_start": 1.0, "mfa_weight_end": 0.1},
+        "fashionmnist": {"mfa_weight_start": 0.5, "mfa_weight_end": 0.05},
+        "stl10"       : {"mfa_weight_start": 0.5, "mfa_weight_end": 0.05},
+    }
+
     print("\nSelect dataset to train on:")
-    print("  1. CIFAR-10")
-    print("  2. Fashion-MNIST")
-    print("  3. STL-10")
+    print("  1. CIFAR-10        (MFA 1.0->0.1)")
+    print("  2. Fashion-MNIST   (MFA 0.5->0.05)")
+    print("  3. STL-10          (MFA 0.5->0.05)")
     print("  4. All three sequentially")
 
     MENU = {"1": ["cifar10"], "2": ["fashionmnist"],
@@ -273,10 +283,12 @@ if __name__ == "__main__":
 
     results = {}
     for ds in MENU[choice]:
-        results[ds] = train(config, ds)
+        cfg = {**BASE, **PER_DATASET[ds]}
+        print(f"\n[v5] {ds}: mfa_weight {cfg['mfa_weight_start']} -> {cfg['mfa_weight_end']}")
+        results[ds] = train(cfg, ds)
 
     print("\n" + "="*60)
-    print("v4 SUMMARY (honest test accuracy)")
+    print("v5 SUMMARY (honest test accuracy, per-dataset MFA tuning)")
     print("="*60)
     for ds, acc in results.items():
         print(f"  {ds:15s}: {acc*100:.2f}%")
